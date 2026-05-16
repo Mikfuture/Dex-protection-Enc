@@ -782,7 +782,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
         val compute = MutableMethodImplementation(4)
         compute.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 1, 3))
         compute.addInstruction(BuilderInstruction23x(Opcode.MUL_INT, 0, 3, 1))
-        compute.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 1, 17))
+        compute.addInstruction(BuilderInstruction21s(Opcode.CONST_16, 1, 17))
         compute.addInstruction(BuilderInstruction23x(Opcode.ADD_INT, 0, 0, 1))
         compute.addInstruction(BuilderInstruction21c(Opcode.SGET, 2, tagField))
         compute.addInstruction(BuilderInstruction23x(Opcode.ADD_INT, 0, 0, 2))
