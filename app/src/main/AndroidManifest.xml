@@ -13,11 +13,12 @@
         android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="29" />
 
-    <!-- Android 11+ 管理所有文件权限（用于直接输出到 /storage/emulated/0/） -->
-    <!-- 你的代码里用到了 Environment.isExternalStorageManager()，所以这个权限必须保留 -->
+    <!-- Android 11+ 管理所有文件权限（用于直接输出到 /sdcard/ApkEnc/） -->
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
 
     <application
         android:allowBackup="true"
+        android:requestLegacyExternalStorage="true"
         android:icon="@mipmap/ic_launcher"
         android:label="@string/app_name"
         android:roundIcon="@mipmap/ic_launcher_round"

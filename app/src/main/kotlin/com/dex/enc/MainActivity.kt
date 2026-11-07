@@ -1,10 +1,13 @@
 package com.dex.enc
 
+import android.Manifest
 import android.widget.Switch
 import android.app.AlertDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
 import android.graphics.Color
 import android.graphics.Typeface
 import android.net.Uri
@@ -15,8 +18,13 @@ import android.os.Handler
 import android.os.Looper
 import android.provider.MediaStore
 import android.util.Base64
+import android.animation.Animator
+import android.animation.AnimatorListenerAdapter
+import android.animation.ValueAnimator
 import android.view.Gravity
 import android.view.View
+import android.view.ViewGroup
+import android.view.animation.DecelerateInterpolator
 import android.widget.ArrayAdapter
 import android.widget.EditText
 import android.widget.FrameLayout
@@ -30,6 +38,7 @@ import android.widget.TextView
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.content.ContextCompat
 import com.google.common.collect.ImmutableSet
 import org.jf.dexlib2.AccessFlags
 import org.jf.dexlib2.DexFileFactory
@@ -57,15 +66,14 @@ import javax.crypto.spec.SecretKeySpec
 class MainActivity : AppCompatActivity() {
 
     private lateinit var etPath: EditText
-// private lateinit var rgMode: RadioGroup
-// private lateinit var rbNormal: RadioButton
-// private lateinit var rbAdvanced: RadioButton
-private lateinit var swNormal: Switch
-private lateinit var swAdvanced: Switch
     private var selectedApkUri: Uri? = null
     private var selectedFileName: String? = null
-    private val encryptKey = SecretKeySpec("MySecureKey12345".toByteArray(), "AES")
     private val handler = Handler(Looper.getMainLooper())
+
+    // --大烧货？
+    private var encMethod = "AES"      
+    private var encStrength = "low"
+    private var antiDecrypt = false
 
 private val openDocumentLauncher =
     registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
@@ -81,13 +89,88 @@ uri?.let {
         }
     }
 
+    // 点击加密图标后要执行的动作，等权限授予后再调用
+    private var pendingAfterPermission: (() -> Unit)? = null
+
+    // Android 11+「所有文件访问权限」的申请结果
+    private val manageStorageLauncher =
+        registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R &&
+                Environment.isExternalStorageManager()
+            ) {
+                runAfterPermission()
+            } else {
+                pendingAfterPermission = null
+                Toast.makeText(this, "未授予「所有文件访问权限」", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    // Android 10 及以下运行时存储权限的申请结果
+    private val storagePermissionLauncher =
+        registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+            if (granted) {
+                runAfterPermission()
+            } else {
+                pendingAfterPermission = null
+                Toast.makeText(this, "未授予存储权限", Toast.LENGTH_SHORT).show()
+            }
+        }
+
+    /** 先申请存储权限，授权通过（或本就不需要）后再执行 action */
+    private fun requestStoragePermissionThen(action: () -> Unit) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+：用「所有文件访问权限」，才能写入 /sdcard/ApkEnc/
+            if (Environment.isExternalStorageManager()) {
+                action()
+                return
+            }
+            pendingAfterPermission = action
+            try {
+                manageStorageLauncher.launch(
+                    Intent(
+                        android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                )
+            } catch (e: Exception) {
+                // 个别机型不支持带包名跳转，回退到权限列表页
+                try {
+                    manageStorageLauncher.launch(
+                        Intent(android.provider.Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                    )
+                } catch (_: Exception) {
+                    pendingAfterPermission = null
+                    Toast.makeText(this, "请手动开启「所有文件访问权限」", Toast.LENGTH_LONG).show()
+                }
+            }
+        } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+            // Android 6.0 ~ 10：运行时申请写外部存储
+            val granted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.WRITE_EXTERNAL_STORAGE
+            ) == PackageManager.PERMISSION_GRANTED
+            if (granted) {
+                action()
+            } else {
+                pendingAfterPermission = action
+                storagePermissionLauncher.launch(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+            }
+        } else {
+            action()
+        }
+    }
+
+    private fun runAfterPermission() {
+        val action = pendingAfterPermission
+        pendingAfterPermission = null
+        action?.invoke()
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         setContentView(R.layout.activity_main)
 etPath = findViewById(R.id.et_path)
-swNormal = findViewById(R.id.sw_normal)
-swAdvanced = findViewById(R.id.sw_advanced)
-// 原来的 rgMode、rbNormal、rbAdvanced 这三行删除或注释掉
+
+        setupEncryptOptions()
 
         findViewById<ImageView>(R.id.iv_choose).setOnClickListener {
             openDocumentLauncher.launch("*/*")
@@ -98,20 +181,7 @@ findViewById<ImageView>(R.id.iv_start).setOnClickListener {
         Toast.makeText(this, "请先选择文件", Toast.LENGTH_SHORT).show()
         return@setOnClickListener
     }
-val normalOn = swNormal.isChecked
-val advancedOn = swAdvanced.isChecked
-
-if (!normalOn && !advancedOn) {
-    Toast.makeText(this, "请至少开启一个加密模式", Toast.LENGTH_SHORT).show()
-    return@setOnClickListener
-}
-
-if (normalOn && advancedOn) {
-    Toast.makeText(this, "请取消普通加密或高级加密再进行加密", Toast.LENGTH_SHORT).show()
-    return@setOnClickListener
-}
-
-val mode = if (normalOn) "normal" else "advanced"
+requestStoragePermissionThen {
     Thread {
         try {
             //  使用原始文件名，保留扩展名
@@ -122,7 +192,7 @@ val mode = if (normalOn) "normal" else "advanced"
                     input.copyTo(output)
                 }
             }
-            handler.post { showEncryptDialog(cacheFile, mode) }
+            handler.post { showEncryptDialog(cacheFile) }
         } catch (e: Exception) {
             handler.post {
                 Toast.makeText(
@@ -134,9 +204,10 @@ val mode = if (normalOn) "normal" else "advanced"
         }
     }.start()
 }
+}
     }
 
-private fun showEncryptDialog(inputApk: File, mode: String) {
+private fun showEncryptDialog(inputApk: File) {
     // 从 XML 加载布局，替代掉原来的代码动态创建
     val rootView = layoutInflater.inflate(R.layout.dialog_encrypt, null)
 
@@ -187,7 +258,7 @@ private fun showEncryptDialog(inputApk: File, mode: String) {
             Toast.makeText(this, "未选中任何DEX文件", Toast.LENGTH_SHORT).show()
             return@setOnClickListener
         }
-        doEncrypt(dialog, inputApk, selectedDex, mode, llLoading, tvStatus, tvSuccess, btnCopy, btnDismiss)
+        doEncrypt(dialog, inputApk, selectedDex, llLoading, tvStatus, tvSuccess, btnCopy, btnDismiss)
     }
 
     // 后台获取 DEX 列表
@@ -207,6 +278,10 @@ private fun showEncryptDialog(inputApk: File, mode: String) {
                     }
                 }
             }
+            val ordered = dexEntries.sortedBy { dexOrderIndex(it) }
+            dexEntries.clear()
+            dexEntries.addAll(ordered)
+
             if (dexEntries.isEmpty()) {
                 handler.post {
                     Toast.makeText(this, "未找到有效DEX文件", Toast.LENGTH_SHORT).show()
@@ -238,36 +313,51 @@ private fun showEncryptDialog(inputApk: File, mode: String) {
         dialog: AlertDialog,
         inputApk: File,
         selectedDex: List<String>,
-        mode: String,
         llLoading: LinearLayout,
         tvStatus: TextView,
         tvSuccess: TextView,
         btnCopy: TextView,
         btnDismiss: TextView
     ) {
+        val scheme = buildScheme(encMethod, encStrength)
+        val usePool = antiDecrypt
         Thread {
             try {
-                val modifiedDexMap = mutableMapOf<String, ByteArray>()
-                for ((index, dexName) in selectedDex.withIndex()) {
-                    handler.post {
-                        tvStatus.text = "正在加密 $dexName (${index + 1}/${selectedDex.size})..."
-                    }
-                    val originalBytes: ByteArray
-                    if (inputApk.extension.equals("dex", true)) {
-                        originalBytes = inputApk.readBytes()
+                // 先把要处理的 DEX 全部读进内存
+                val dexBytesList = mutableListOf<Pair<String, ByteArray>>()
+                for (dexName in selectedDex) {
+                    val bytes = if (inputApk.extension.equals("dex", true)) {
+                        inputApk.readBytes()
                     } else {
-                        originalBytes = ZipFile(inputApk).use {
+                        ZipFile(inputApk).use {
                             it.getInputStream(it.getEntry(dexName)!!).readBytes()
                         }
                     }
+                    dexBytesList.add(dexName to bytes)
+                }
+
+                // 防字符串解密：跨 DEX 统一建池，保证每个 dex 里的索引一致
+                val stringIndexMap: Map<String, Int> = if (usePool) {
+                    handler.post { tvStatus.text = "正在收集字符串池..." }
+                    collectStringPoolMap(dexBytesList.map { it.second })
+                } else {
+                    emptyMap()
+                }
+
+                val modifiedDexMap = mutableMapOf<String, ByteArray>()
+                for ((index, item) in dexBytesList.withIndex()) {
+                    val dexName = item.first
+                    handler.post {
+                        tvStatus.text = "正在加密 $dexName (${index + 1}/${dexBytesList.size})..."
+                    }
                     modifiedDexMap[dexName] = processSingleDex(
-                        originalBytes,
+                        item.second,
                         index == 0,
-                        mode,
-                        emptyMap()
+                        scheme,
+                        stringIndexMap
                     )
                     handler.post {
-                        tvStatus.text = "$dexName 加密成功 (${index + 1}/${selectedDex.size})"
+                        tvStatus.text = "$dexName 加密成功 (${index + 1}/${dexBytesList.size})"
                     }
                 }
 
@@ -301,7 +391,284 @@ private fun showEncryptDialog(inputApk: File, mode: String) {
         }.start()
     }
 
+
+    private fun dexOrderIndex(name: String): Int {
+        val lower = name.lowercase()
+        if (!lower.endsWith(".dex")) return 1
+        val mid = lower.removeSuffix(".dex").removePrefix("classes")
+        return mid.toIntOrNull() ?: 1
+    }
+
+
+
+    private fun setupEncryptOptions() {
+        val methodRow = findViewById<LinearLayout>(R.id.ll_method_row)
+        val methodArrow = findViewById<TextView>(R.id.tv_method_arrow)
+        val methodValue = findViewById<TextView>(R.id.tv_method_value)
+        val methodOptions = findViewById<LinearLayout>(R.id.ll_method_options)
+        val strengthRow = findViewById<LinearLayout>(R.id.ll_strength_row)
+        val strengthArrow = findViewById<TextView>(R.id.tv_strength_arrow)
+        val strengthValue = findViewById<TextView>(R.id.tv_strength_value)
+        val strengthOptions = findViewById<LinearLayout>(R.id.ll_strength_options)
+
+        findViewById<Switch>(R.id.sw_anti_decrypt).setOnCheckedChangeListener { _, checked ->
+            antiDecrypt = checked
+        }
+
+        val methodViews = listOf(
+            "Base64" to findViewById<TextView>(R.id.op_method_base64),
+            "AES" to findViewById<TextView>(R.id.op_method_aes),
+            "DES" to findViewById<TextView>(R.id.op_method_des),
+            "RC4" to findViewById<TextView>(R.id.op_method_rc4)
+        )
+        val strengthViews = listOf(
+            "low" to findViewById<TextView>(R.id.op_strength_low),
+            "medium" to findViewById<TextView>(R.id.op_strength_medium),
+            "high" to findViewById<TextView>(R.id.op_strength_high)
+        )
+
+        fun paint(view: TextView, selected: Boolean, label: String) {
+            view.text = (if (selected) "● " else "○ ") + label
+            view.setTextColor(Color.parseColor(if (selected) "#3A7AFE" else "#555555"))
+            view.setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
+        }
+
+        fun renderMethod() {
+            methodValue.text = encMethod
+            methodViews.forEach { (key, view) -> paint(view, key == encMethod, METHOD_LABELS[key] ?: key) }
+        }
+
+        fun renderStrength() {
+            strengthValue.text = STRENGTH_LABELS[encStrength] ?: "低"
+            strengthViews.forEach { (key, view) -> paint(view, key == encStrength, STRENGTH_TEXTS[key] ?: key) }
+        }
+
+        // 抽屉开合：弹出/收回都是「先快后慢」，起步最猛，越接近终点越稳
+        methodRow.setOnClickListener { toggleDrawer(methodOptions, methodArrow) }
+        strengthRow.setOnClickListener { toggleDrawer(strengthOptions, strengthArrow) }
+        methodViews.forEach { (key, view) ->
+            view.setOnClickListener {
+                encMethod = key
+                renderMethod()
+            }
+        }
+        strengthViews.forEach { (key, view) ->
+            view.setOnClickListener {
+                encStrength = key
+                renderStrength()
+            }
+        }
+
+        renderMethod()
+        renderStrength()
+    }
+
+    // ============ 抽屉动画：先快后慢 ============
+
+    private val drawerAnimators = mutableMapOf<View, ValueAnimator>()
+
+    /** 抽屉的逻辑开合状态。不能靠 visibility 判断——面板全程 visible，只是高度在变 */
+    private val openDrawers = mutableSetOf<View>()
+
+    private fun toggleDrawer(panel: View, arrow: TextView) {
+        val opening = panel !in openDrawers
+        if (opening) openDrawers.add(panel) else openDrawers.remove(panel)
+        arrow.text = if (opening) "▴" else "▾"
+        animateDrawer(panel, opening)
+    }
+
+
+    private fun animateDrawer(panel: View, opening: Boolean) {
+        // 连点保护：先掉上一条动画，再拿当前高度作为起点
+        drawerAnimators.remove(panel)?.cancel()
+
+        val start = panel.height
+        // 只有展开需要量内容高度；收缩时多量一次只会让子 View 白跑一遍排版
+        val target = if (opening) measureDrawerContent(panel) else 0
+
+        // 只改 height 字段 + requestLayout，不整块重设 layoutParams
+        val lp = panel.layoutParams
+        if (lp.height != start) {
+            lp.height = start
+            panel.requestLayout()
+        }
+
+        if (start == target) {
+            finishDrawer(panel, opening)
+            return
+        }
+
+        val animator = ValueAnimator.ofInt(start, target)
+        animator.duration = DRAWER_DURATION_MS
+        animator.interpolator = DecelerateInterpolator(DRAWER_DECELERATE_FACTOR)
+        animator.addUpdateListener { anim ->
+            val h = anim.animatedValue as Int
+            val params = panel.layoutParams
+            if (params.height != h) {
+                params.height = h
+                panel.requestLayout()
+            }
+        }
+        animator.addListener(object : AnimatorListenerAdapter() {
+            override fun onAnimationEnd(animation: Animator) {
+                // 被新动画抢占时不要收尾，否则会瞬跳
+                if (drawerAnimators[panel] === animation) {
+                    drawerAnimators.remove(panel)
+                    finishDrawer(panel, opening)
+                }
+            }
+        })
+        drawerAnimators[panel] = animator
+        animator.start()
+    }
+
+    private fun finishDrawer(panel: View, opening: Boolean) {
+        // 收尾只把高度落定：展开回到 WRAP_CONTENT，收起就留在 0。
+        // 没有任何可见性变更，所以不会有最后一帧的闪。
+        val lp = panel.layoutParams
+        val settled = if (opening) ViewGroup.LayoutParams.WRAP_CONTENT else 0
+        if (lp.height != settled) {
+            lp.height = settled
+            panel.requestLayout()
+        }
+    }
+
+    /** 量出抽屉完全展开后的高度（高度 0 状态下也能量） */
+    private fun measureDrawerContent(panel: View): Int {
+        // 用父容器的「内容宽度」量，必须减掉 padding，不能直接用 parent.width。
+        // 量宽了文字换行位置会算错，展开到最后一下会抽。
+        val parent = panel.parent as? View
+        val parentContentWidth = if (parent != null) {
+            parent.width - parent.paddingLeft - parent.paddingRight
+        } else 0
+        val width = if (parentContentWidth > 0) parentContentWidth else resources.displayMetrics.widthPixels
+        panel.measure(
+            View.MeasureSpec.makeMeasureSpec(width, View.MeasureSpec.EXACTLY),
+            View.MeasureSpec.makeMeasureSpec(0, View.MeasureSpec.UNSPECIFIED)
+        )
+        return panel.measuredHeight
+    }
+
+    /** 加密方案：算法 / JCE 名 / Cipher 变换串 / 密钥字面量 */
+    private class EncScheme(
+        val method: String,
+        val jceName: String,
+        val transform: String,
+        val keyText: String
+    )
+
+    private fun keyTextFor(strength: String): String {
+        val base = "MySecureKey12345ForgeCinderK7x9QzPaBv2NmLd5"
+        val len = when (strength) {
+            "medium" -> 24
+            "high" -> 32
+            else -> 16
+        }
+        return base.take(len)
+    }
+
+    private fun buildScheme(method: String, strength: String): EncScheme {
+        val keyText = keyTextFor(strength)
+        return when (method) {
+            "Base64" -> EncScheme("Base64", "", "", "")
+            "DES" -> EncScheme("DES", "DES", "DES/ECB/PKCS5Padding", keyText.take(8))
+            "RC4" -> EncScheme("RC4", "ARCFOUR", "ARCFOUR", keyText)
+            else -> EncScheme("AES", "AES", "AES/ECB/PKCS5Padding", keyText)
+        }
+    }
+
+    /** 把明文压成密文串（统一用 Base64 承载，方便以 const-string 存放） */
+    private fun encryptPayload(plain: String, scheme: EncScheme): String {
+        val raw = plain.toByteArray(Charsets.UTF_8)
+        val payload: ByteArray = if (scheme.method == "Base64") {
+            raw
+        } else {
+            val cipher = Cipher.getInstance(scheme.transform)
+            cipher.init(
+                Cipher.ENCRYPT_MODE,
+                SecretKeySpec(scheme.keyText.toByteArray(Charsets.UTF_8), scheme.jceName)
+            )
+            cipher.doFinal(raw)
+        }
+        return Base64.encodeToString(payload, Base64.NO_WRAP)
+    }
+
+    /** 防字符串解密：跨全部 DEX 收一收字符串，统一编号（超上限的保持就地加密） */
+    private fun collectStringPoolMap(dexBytesList: List<ByteArray>): Map<String, Int> {
+        val pool = linkedSetOf<String>()
+        val opcodes = Opcodes.getDefault()
+        for ((i, bytes) in dexBytesList.withIndex()) {
+            val scanFile = File(cacheDir, "scan_pool_$i.dex")
+            try {
+                scanFile.writeBytes(bytes)
+                val dex = DexFileFactory.loadDexFile(scanFile, opcodes)
+                for (classDef in dex.classes) {
+                    if (classDef.type == "Lcom/secure/Decryptor;" ||
+                        classDef.type == "Lcom/secure/StringPool;"
+                    ) continue
+                    for (method in classDef.methods) {
+                        val impl = method.implementation ?: continue
+                        for (ins in impl.instructions) {
+                            if (ins is ReferenceInstruction && ins.reference is StringReference) {
+                                pool.add((ins.reference as StringReference).string)
+                            }
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+            } finally {
+                scanFile.delete()
+            }
+        }
+        val selected = pool
+            .filter { it.length >= 2 }
+            .sortedByDescending { it.length }
+            .take(MAX_POOL_STRINGS)
+        val map = linkedMapOf<String, Int>()
+        selected.forEachIndexed { index, s -> map[s] = index }
+        return map
+    }
+
+    private fun buildEncryptedPool(map: Map<String, Int>, scheme: EncScheme): List<String> {
+        val max = map.values.maxOrNull() ?: return emptyList()
+        val arr = MutableList(max + 1) { "" }
+        map.forEach { (plain, index) -> arr[index] = encryptPayload(plain, scheme) }
+        return arr
+    }
+
     private fun getSafeOutputDirectory(): File {
+        // Android 11+：优先输出到公共目录 /sdcard/ApkEnc/（需要 MANAGE_EXTERNAL_STORAGE）
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (Environment.isExternalStorageManager()) {
+                val publicDir = File(Environment.getExternalStorageDirectory(), "ApkEnc")
+                if (publicDir.exists() || publicDir.mkdirs()) {
+                    return publicDir
+                }
+            } else {
+                // 未授权时跳转到「所有文件访问权限」设置页，本次先回退到私有目录
+                try {
+                    val intent = android.content.Intent(
+                        android.provider.Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+                        Uri.parse("package:$packageName")
+                    )
+                    startActivity(intent)
+                    handler.post {
+                        Toast.makeText(
+                            this,
+                            "请开启「所有文件访问权限」，开启后重新加密即可输出到 /sdcard/ApkEnc/",
+                            Toast.LENGTH_LONG
+                        ).show()
+                    }
+                } catch (_: Exception) {
+                }
+            }
+        } else {
+            // Android 10 及以下：有 WRITE_EXTERNAL_STORAGE 就能直接写公共目录
+            val publicDir = File(Environment.getExternalStorageDirectory(), "ApkEnc")
+            if (publicDir.exists() || publicDir.mkdirs()) {
+                return publicDir
+            }
+        }
         val dir = getExternalFilesDir("DexEnc") ?: cacheDir
         if (!dir.exists()) dir.mkdirs()
         return dir
@@ -355,19 +722,19 @@ private fun getRealPathFromUri(uri: Uri): String? {
     private fun processSingleDex(
         dexBytes: ByteArray,
         injectDecryptor: Boolean,
-        mode: String,
+        scheme: EncScheme,
         stringIndexMap: Map<String, Int>
     ): ByteArray {
         val tempIn = File(cacheDir, "temp_in.dex")
         tempIn.writeBytes(dexBytes)
         val opcodes = Opcodes.getDefault()
         val originalDex = DexFileFactory.loadDexFile(tempIn, opcodes)
-        val rewrittenDex = createDexRewriter(mode, stringIndexMap).getDexFileRewriter().rewrite(originalDex)
+        val rewrittenDex = createDexRewriter(scheme, stringIndexMap).getDexFileRewriter().rewrite(originalDex)
         val allClasses = rewrittenDex.classes.mapTo(mutableSetOf<ClassDef>()) { it }
         if (injectDecryptor) {
-            allClasses.add(buildDecryptorClass())
-            if (mode == "advanced") {
-                allClasses.add(buildStringPoolClass(stringIndexMap))
+            allClasses.add(buildDecryptorClass(scheme))
+            if (stringIndexMap.isNotEmpty()) {
+                allClasses.add(buildStringPoolClass(buildEncryptedPool(stringIndexMap, scheme)))
             }
         }
         val tempOut = File(cacheDir, "temp_out.dex")
@@ -378,17 +745,8 @@ private fun getRealPathFromUri(uri: Uri): String? {
         return result
     }
 
-    private fun buildStringPoolClass(stringIndexMap: Map<String, Int>): ClassDef {
+    private fun buildStringPoolClass(encStrings: List<String>): ClassDef {
         val classType = "Lcom/secure/StringPool;"
-        val encStrings = stringIndexMap.keys.map { str ->
-            try {
-                val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
-                c.init(Cipher.ENCRYPT_MODE, encryptKey)
-                Base64.encodeToString(c.doFinal(str.toByteArray()), Base64.NO_WRAP)
-            } catch (e: Exception) {
-                str
-            }
-        }
         val arrayField = ImmutableField(
             classType, "S", "[Ljava/lang/String;",
             AccessFlags.PRIVATE.value or AccessFlags.STATIC.value or AccessFlags.FINAL.value,
@@ -438,12 +796,36 @@ private fun getRealPathFromUri(uri: Uri): String? {
         )
     }
 
-    private fun buildDecryptorClass(): ClassDef {
+    private fun buildDecryptorClass(scheme: EncScheme): ClassDef {
         val ct = "Lcom/secure/Decryptor;"
+        val b64Decode = ImmutableMethodReference(
+            "Landroid/util/Base64;", "decode",
+            listOf("Ljava/lang/String;", "I"), "[B"
+        )
+        val strInit = ImmutableMethodReference("Ljava/lang/String;", "<init>", listOf("[B"), "V")
+
+        // 纯 Base64：不做密码运算，解码后直接还原字符串
+        if (scheme.method == "Base64") {
+            val di = MutableMethodImplementation(3)
+            di.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 0, 0))
+            di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 2, 2, 0, 0, 0, 0, b64Decode))
+            di.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 1))
+            di.addInstruction(BuilderInstruction21c(Opcode.NEW_INSTANCE, 0, ImmutableTypeReference("Ljava/lang/String;")))
+            di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 2, 0, 1, 0, 0, 0, strInit))
+            di.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 0))
+            return ImmutableClassDef(
+                ct, AccessFlags.PUBLIC.value, "Ljava/lang/Object;",
+                emptyList(), null, ImmutableSet.of(), emptyList(), emptyList(),
+                listOf(
+                    ImmutableMethod(ct, "decrypt", listOf(ImmutableMethodParameter("Ljava/lang/String;", ImmutableSet.of(), null)), "Ljava/lang/String;", AccessFlags.PUBLIC.value or AccessFlags.STATIC.value, ImmutableSet.of(), ImmutableSet.of(), di)
+                ), emptyList()
+            )
+        }
+
         val kf = ImmutableField(ct, "key", "[B", AccessFlags.PRIVATE.value or AccessFlags.STATIC.value, null, ImmutableSet.of(), ImmutableSet.of())
 
         val ci = MutableMethodImplementation(2)
-        ci.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 0, ImmutableStringReference("MySecureKey12345")))
+        ci.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 0, ImmutableStringReference(scheme.keyText)))
         ci.addInstruction(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 1, 0, 0, 0, 0, 0, ImmutableMethodReference("Ljava/lang/String;", "getBytes", emptyList(), "[B")))
         ci.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 1))
         ci.addInstruction(BuilderInstruction21c(Opcode.SPUT_OBJECT, 1, kf))
@@ -451,13 +833,13 @@ private fun getRealPathFromUri(uri: Uri): String? {
 
         val di = MutableMethodImplementation(5)
         di.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 0, 0))
-        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 2, 4, 0, 0, 0, 0, ImmutableMethodReference("Landroid/util/Base64;", "decode", listOf("Ljava/lang/String;", "I"), "[B")))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 2, 4, 0, 0, 0, 0, b64Decode))
         di.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 1))
         di.addInstruction(BuilderInstruction21c(Opcode.NEW_INSTANCE, 2, ImmutableTypeReference("Ljavax/crypto/spec/SecretKeySpec;")))
         di.addInstruction(BuilderInstruction21c(Opcode.SGET_OBJECT, 0, kf))
-        di.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 3, ImmutableStringReference("AES")))
+        di.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 3, ImmutableStringReference(scheme.jceName)))
         di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 3, 2, 0, 3, 0, 0, ImmutableMethodReference("Ljavax/crypto/spec/SecretKeySpec;", "<init>", listOf("[B", "Ljava/lang/String;"), "V")))
-        di.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 0, ImmutableStringReference("AES/ECB/PKCS5Padding")))
+        di.addInstruction(BuilderInstruction21c(Opcode.CONST_STRING, 0, ImmutableStringReference(scheme.transform)))
         di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_STATIC, 1, 0, 0, 0, 0, 0, ImmutableMethodReference("Ljavax/crypto/Cipher;", "getInstance", listOf("Ljava/lang/String;"), "Ljavax/crypto/Cipher;")))
         di.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 0))
         di.addInstruction(BuilderInstruction11n(Opcode.CONST_4, 3, 2))
@@ -465,7 +847,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
         di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_VIRTUAL, 2, 0, 1, 0, 0, 0, ImmutableMethodReference("Ljavax/crypto/Cipher;", "doFinal", listOf("[B"), "[B")))
         di.addInstruction(BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, 1))
         di.addInstruction(BuilderInstruction21c(Opcode.NEW_INSTANCE, 2, ImmutableTypeReference("Ljava/lang/String;")))
-        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 2, 2, 1, 0, 0, 0, ImmutableMethodReference("Ljava/lang/String;", "<init>", listOf("[B"), "V")))
+        di.addInstruction(BuilderInstruction35c(Opcode.INVOKE_DIRECT, 2, 2, 1, 0, 0, 0, strInit))
         di.addInstruction(BuilderInstruction11x(Opcode.RETURN_OBJECT, 2))
 
         return ImmutableClassDef(
@@ -478,7 +860,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
         )
     }
 
-    private fun createDexRewriter(mode: String, stringIndexMap: Map<String, Int>): DexRewriter {
+    private fun createDexRewriter(scheme: EncScheme, stringIndexMap: Map<String, Int>): DexRewriter {
         return DexRewriter(object : RewriterModule() {
             override fun getClassDefRewriter(rewriters: Rewriters): Rewriter<ClassDef> {
                 val r = super.getClassDefRewriter(rewriters)
@@ -513,7 +895,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
                                 val str = (inst.reference as StringReference).string
                                 val reg = if (inst is OneRegisterInstruction) inst.registerA else -1
                                 if (reg >= 0) {
-                                    if (mode == "advanced" && stringIndexMap.containsKey(str)) {
+                                    if (stringIndexMap.containsKey(str)) {
                                         val idx = stringIndexMap[str]!!
                                         if (idx in -8..7) {
                                             m.replaceInstruction(i, BuilderInstruction11n(Opcode.CONST_4, reg, idx))
@@ -531,13 +913,7 @@ private fun getRealPathFromUri(uri: Uri): String? {
                                         m.addInstruction(i + 2, BuilderInstruction11x(Opcode.MOVE_RESULT_OBJECT, reg))
                                         i += 2
                                     } else {
-                                        val enc = try {
-                                            val c = Cipher.getInstance("AES/ECB/PKCS5Padding")
-                                            c.init(Cipher.ENCRYPT_MODE, encryptKey)
-                                            Base64.encodeToString(c.doFinal(str.toByteArray()), Base64.NO_WRAP)
-                                        } catch (e: Exception) {
-                                            str
-                                        }
+                                        val enc = encryptPayload(str, scheme)
                                         m.replaceInstruction(i, BuilderInstruction21c(Opcode.CONST_STRING, reg, ImmutableStringReference(enc)))
                                         val decRef = ImmutableMethodReference("Lcom/secure/Decryptor;", "decrypt", listOf("Ljava/lang/String;"), "Ljava/lang/String;")
                                         if (reg < 16) {
@@ -561,24 +937,230 @@ private fun getRealPathFromUri(uri: Uri): String? {
         })
     }
 
+    /**
+     * 重新打包 APK。
+     *
+     * 两趟写：
+     *  1) 正常写出并对齐（resources.arsc 强制 STORED + 4 字节对齐，.so 按 4096）；
+     *  2) 回读产物自检 resources.arsc 的数据区偏移，若没落在 4 字节边界上，
+     *     给第一个条目多塞 4+shift 字节的 extra 把后面整体后移 shift 字节，再写一遍。
+     *
+     * 这样无论 JDK 写本地头时怎么处理 extra，最终产物都是对齐的。
+     */
     private fun repackApk(originalApk: File, modifiedDexMap: Map<String, ByteArray>, outputApk: File) {
-        ZipOutputStream(FileOutputStream(outputApk)).use { zos ->
-            ZipFile(originalApk).use { zip ->
-                val entries = zip.entries()
-                while (entries.hasMoreElements()) {
-                    val e = entries.nextElement()
-                    if (!modifiedDexMap.containsKey(e.name)) {
-                        zos.putNextEntry(ZipEntry(e.name))
-                        zip.getInputStream(e).use { it.copyTo(zos) }
+        val arscLocOffset = writeRepackedApk(originalApk, modifiedDexMap, outputApk, 0)
+        val shift = resourcesArscShiftNeeded(outputApk, arscLocOffset)
+        if (shift > 0) {
+            writeRepackedApk(originalApk, modifiedDexMap, outputApk, shift)
+        }
+    }
+
+    /** 写一趟，返回 resources.arsc 本地头偏移（没找到则 -1） */
+    private fun writeRepackedApk(
+        originalApk: File,
+        modifiedDexMap: Map<String, ByteArray>,
+        outputApk: File,
+        globalShift: Int
+    ): Long {
+        var arscLocOffset = -1L
+        var shiftPending = globalShift > 0
+        ZipFile(originalApk).use { zip ->
+            // 注意：这里不能再套 BufferedOutputStream——对齐计算依赖 counter.count
+            // 精确等于「下一个本地文件头的起始偏移」，缓冲会让计数滞后。
+            CountingOutputStream(FileOutputStream(outputApk)).use { counter ->
+                ZipOutputStream(counter).use { zos ->
+                    val entries = zip.entries()
+                    while (entries.hasMoreElements()) {
+                        val e = entries.nextElement()
+                        // 被替换的 dex 跳过（稍后统一写入）
+                        if (modifiedDexMap.containsKey(e.name)) continue
+                        // 改动后的 APK 原签名必然失效，丢掉旧签名文件，交给用户重新签名
+                        if (isSignatureFile(e.name)) continue
+
+                        // 需要整体后移：塞在第一个写出的条目上，它后面所有偏移一起挪
+                        val prePad: ByteArray? = if (shiftPending) {
+                            shiftPending = false
+                            paddingExtra(4 + globalShift)
+                        } else null
+
+                        val ne = ZipEntry(e.name)
+                        ne.time = e.time
+                        if (e.isDirectory) {
+                            ne.extra = prePad
+                            zos.putNextEntry(ne)
+                            zos.closeEntry()
+                            continue
+                        }
+
+                        // Android 11 +：resources.arsc 必须 STORED。
+                        // 源里就算是被压过的，也要掰回来，否则装不上：
+                        // "Targeting R+ requires the resources.arsc ... to be stored uncompressed"
+                        val mustStore = e.name == "resources.arsc"
+                        if (e.method == ZipEntry.STORED || mustStore) {
+                            ne.method = ZipEntry.STORED
+                            ne.size = e.size
+                            ne.compressedSize = e.size
+                            ne.crc = e.crc
+                            val align = if (e.name.endsWith(".so")) 4096 else 4
+                            ne.extra = mergeExtra(
+                                prePad,
+                                alignmentExtra(counter.count, e.name, align, prePad?.size ?: 0)
+                            )
+                            if (mustStore) arscLocOffset = counter.count
+                            zos.putNextEntry(ne)
+                            zip.getInputStream(e).use { it.copyTo(zos) }
+                        } else {
+                            ne.extra = prePad
+                            zos.putNextEntry(ne)
+                            zip.getInputStream(e).use { it.copyTo(zos) }
+                        }
+                        zos.closeEntry()
+                    }
+
+                    // 写入加密后的 dex（DEX 允许压缩，保持 DEFLATED 以减小体积）
+                    for ((name, bytes) in modifiedDexMap) {
+                        val de = ZipEntry(name)
+                        zos.putNextEntry(de)
+                        zos.write(bytes)
                         zos.closeEntry()
                     }
                 }
             }
-            for ((name, bytes) in modifiedDexMap) {
-                zos.putNextEntry(ZipEntry(name))
-                zos.write(bytes)
-                zos.closeEntry()
+        }
+        return arscLocOffset
+    }
+
+    /**
+     * 回读产物自检：resources.arsc 的数据区是否落在 4 字节边界上。
+     * 返回需要整体后移的字节数（0 = 已经对齐，或压根查不到）。
+     */
+    private fun resourcesArscShiftNeeded(apk: File, locOffset: Long): Int {
+        if (locOffset < 0) return 0
+        var shift = 0
+        try {
+            java.io.RandomAccessFile(apk, "r").use { raf ->
+                val header = ByteArray(30)
+                raf.seek(locOffset)
+                raf.readFully(header)
+                // 本地头签名 0x04034b50，压缩方式字段为 0 才算 STORED
+                if (le32(header, 0) == 0x04034b50L && le16(header, 8) == 0) {
+                    val nameLen = le16(header, 26)
+                    val extraLen = le16(header, 28)
+                    val dataOffset = locOffset + 30L + nameLen + extraLen
+                    shift = ((4 - (dataOffset % 4)) % 4).toInt()
+                }
             }
+        } catch (_: Exception) {
+            shift = 0
+        }
+        return shift
+    }
+
+    private fun le16(b: ByteArray, off: Int): Int =
+        (b[off].toInt() and 0xFF) or ((b[off + 1].toInt() and 0xFF) shl 8)
+
+    private fun le32(b: ByteArray, off: Int): Long =
+        ((b[off].toInt() and 0xFF).toLong()) or
+            ((b[off + 1].toInt() and 0xFF).toLong() shl 8) or
+            ((b[off + 2].toInt() and 0xFF).toLong() shl 16) or
+            ((b[off + 3].toInt() and 0xFF).toLong() shl 24)
+
+    /** 旧 v1 签名文件：内容被改动后必然校验失败，直接剔除 */
+    private fun isSignatureFile(name: String): Boolean {
+        if (!name.startsWith("META-INF/")) return false
+        val upper = name.uppercase()
+        return upper.endsWith(".SF") || upper.endsWith(".RSA") ||
+            upper.endsWith(".DSA") || upper.endsWith(".EC") ||
+            upper == "META-INF/MANIFEST.MF"
+    }
+
+    /**
+     * 计算让 entry 数据区起始位置对齐到 align 的 extra 字段。
+     *
+     * 数据区偏移 = headerOffset + 30(本地头) + nameLen + prePad + extraLen，
+     * 本地文件头固定 30 字节（4 签名 + 2 版本 + 2 标志 + 2 方法 + 4 时间
+     * + 4 crc + 4 压缩后大小 + 4 原始大小 + 2 名字长 + 2 extra 长），
+     * 后面紧跟 name 和 extra，所以数据区偏移就是上面这个式子。
+     *
+     * extra 字段要么为空，要么至少 4 字节（2 字节 id + 2 字节长度），
+     * 而且 extraLen 本身参与偏移计算，所以必须按 extraLen 反解：
+     * 从小到大找第一个满足 (base + extraLen) % align == 0 且 extraLen == 0 或 >= 4 的值。
+     */
+    private fun alignmentExtra(headerOffset: Long, name: String, align: Int, prePad: Int): ByteArray? {
+        val nameLen = name.toByteArray(Charsets.UTF_8).size
+        val base = headerOffset + 30 + nameLen + prePad
+        // 上限要留出一个完整对齐周期的余量：最小的合法 extraLen 可能落在
+        // [4, align+3] 区间内（例如 base%4==2 时合法值是 2,6,10...，要取 6）。
+        var extraLen = 0
+        while (extraLen <= align + 4) {
+            if ((base + extraLen) % align == 0L) {
+                if (extraLen == 0) return null
+                if (extraLen >= 4) return paddingExtra(extraLen)
+            }
+            extraLen++
+        }
+        return null
+    }
+
+    /**
+     * 造一个长度恰好为 len（>=4）的合法 extra 子字段，只用来占位撑偏移。
+     * 结构：2 字节 id(0x35D9) + 2 字节数据长 + N 字节 0。
+     */
+    private fun paddingExtra(len: Int): ByteArray {
+        val n = if (len < 4) 4 else len
+        val extra = ByteArray(n)
+        extra[0] = 0xD9.toByte()
+        extra[1] = 0x35.toByte()
+        val payload = n - 4
+        extra[2] = (payload and 0xFF).toByte()
+        extra[3] = ((payload shr 8) and 0xFF).toByte()
+        return extra
+    }
+
+    /** 拼两个 extra 字段（各自都是合法子字段序列，直接首尾相接即可） */
+    private fun mergeExtra(a: ByteArray?, b: ByteArray?): ByteArray? = when {
+        a == null || a.isEmpty() -> b
+        b == null || b.isEmpty() -> a
+        else -> a + b
+    }
+
+    companion object {
+        private const val MAX_POOL_STRINGS = 2000
+
+        // 抽屉弹出抽查动画！！！噢齁齁齁齁齁齁
+        private const val DRAWER_DURATION_MS = 300L
+        private const val DRAWER_DECELERATE_FACTOR = 1.0f
+
+        private val METHOD_LABELS = mapOf(
+            "Base64" to "Base64（仅编码混淆）",
+            "AES" to "AES（对称加密，推荐）",
+            "DES" to "DES（轻量对称加密）",
+            "RC4" to "RC4（流加密，速度快）"
+        )
+        private val STRENGTH_LABELS = mapOf(
+            "low" to "低",
+            "medium" to "中",
+            "high" to "高"
+        )
+        private val STRENGTH_TEXTS = mapOf(
+            "low" to "低（128 位密钥）",
+            "medium" to "中（192 位密钥）",
+            "high" to "高（256 位密钥）"
+        )
+    }
+
+    private class CountingOutputStream(out: java.io.OutputStream) : java.io.FilterOutputStream(out) {
+        var count: Long = 0L
+            private set
+
+        override fun write(b: Int) {
+            out.write(b)
+            count++
+        }
+
+        override fun write(b: ByteArray, off: Int, len: Int) {
+            out.write(b, off, len)
+            count += len
         }
     }
 }
