@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  配置弹窗的遮罩层。
+  不用 AlertDialog，因为 Dialog 是独立 Window，内容高度一变就要 relayout 窗口
+  （一次 IPC + surface 调整），高度动画每帧都会触发，抽屉会卡。
+  放在 Activity 自己的窗口里就没有这个开销。
+
+  遮罩和卡片拆成两个 View，进场时才能分别做淡入 / 放大动画。
+-->
+<FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:clickable="true"
+    android:focusable="true">
+
+    <View
+        android:id="@+id/config_scrim"
+        android:layout_width="match_parent"
+        android:layout_height="match_parent"
+        android:background="#99000000" />
+
+    <include
+        android:id="@+id/config_card"
+        layout="@layout/dialog_dex_config"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center"
+        android:layout_marginStart="20dp"
+        android:layout_marginEnd="20dp" />
+</FrameLayout>

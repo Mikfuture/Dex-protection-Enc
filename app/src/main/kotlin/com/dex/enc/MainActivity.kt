@@ -170,7 +170,7 @@ uri?.let {
         setContentView(R.layout.activity_main)
 etPath = findViewById(R.id.et_path)
 
-        setupEncryptOptions()
+        setupFunctionList()
 
         findViewById<ImageView>(R.id.iv_choose).setOnClickListener {
             openDocumentLauncher.launch("*/*")
@@ -181,8 +181,14 @@ findViewById<ImageView>(R.id.iv_start).setOnClickListener {
         Toast.makeText(this, "请先选择文件", Toast.LENGTH_SHORT).show()
         return@setOnClickListener
     }
-requestStoragePermissionThen {
-    Thread {
+    if (!dexEncryptChecked && !dexObfuscateChecked) {
+        Toast.makeText(this, "请先勾选 Dex加密 或 Dex混淆", Toast.LENGTH_SHORT).show()
+        return@setOnClickListener
+    }
+    // 先弹「Dex加密配置」圆角弹窗，点确定之后才申请权限、再进入选 DEX 的流程
+    showDexConfigDialog {
+        requestStoragePermissionThen {
+            Thread {
         try {
             //  使用原始文件名，保留扩展名
             val fileName = selectedFileName ?: "input.apk"
@@ -203,6 +209,7 @@ requestStoragePermissionThen {
             }
         }
     }.start()
+}
 }
 }
     }
@@ -319,12 +326,19 @@ private fun showEncryptDialog(inputApk: File) {
         btnCopy: TextView,
         btnDismiss: TextView
     ) {
+        val doEnc = dexEncryptChecked
+        val doObf = dexObfuscateChecked
         val scheme = buildScheme(encMethod, encStrength)
-        val usePool = antiDecrypt
+        val usePool = doEnc && antiDecrypt
+        val outPrefix = when {
+            doObf && doEnc -> "obf_enc_"
+            doObf -> "obf_"
+            else -> "enc_"
+        }
         Thread {
             try {
                 // 先把要处理的 DEX 全部读进内存
-                val dexBytesList = mutableListOf<Pair<String, ByteArray>>()
+                var dexBytesList = mutableListOf<Pair<String, ByteArray>>()
                 for (dexName in selectedDex) {
                     val bytes = if (inputApk.extension.equals("dex", true)) {
                         inputApk.readBytes()
@@ -336,7 +350,21 @@ private fun showEncryptDialog(inputApk: File) {
                     dexBytesList.add(dexName to bytes)
                 }
 
-                // 防字符串解密：跨 DEX 统一建池，保证每个 dex 里的索引一致
+                // 1) 字符串加密（StringFog）：一字符串一随机密钥 + 重复密钥 XOR。
+                //    不碰类名/方法名、不改控制流，所以不会有反射兼容问题。
+                if (doObf) {
+                    handler.post { tvStatus.text = "正在加密字符串..." }
+                    dexBytesList = StringFogObfuscator
+                        .apply(
+                            dexBytesList,
+                            cacheDir,
+                            FogOptions(fogEnabled, fogKeyLength, fogEnhanced, fogJunk)
+                        )
+                        .toMutableList()
+                    handler.post { tvStatus.text = "字符串加密完成" }
+                }
+
+                // 2) 再加密。防字符串解密：跨 DEX 统一建池，保证每个 dex 里的索引一致
                 val stringIndexMap: Map<String, Int> = if (usePool) {
                     handler.post { tvStatus.text = "正在收集字符串池..." }
                     collectStringPoolMap(dexBytesList.map { it.second })
@@ -347,6 +375,11 @@ private fun showEncryptDialog(inputApk: File) {
                 val modifiedDexMap = mutableMapOf<String, ByteArray>()
                 for ((index, item) in dexBytesList.withIndex()) {
                     val dexName = item.first
+                    if (!doEnc) {
+                        // 只勾了混淆：原样写回处理后的字节
+                        modifiedDexMap[dexName] = item.second
+                        continue
+                    }
                     handler.post {
                         tvStatus.text = "正在加密 $dexName (${index + 1}/${dexBytesList.size})..."
                     }
@@ -363,7 +396,7 @@ private fun showEncryptDialog(inputApk: File) {
 
                 if (inputApk.extension.equals("dex", true)) {
                     // 单独DEX：直接输出，不显示"请签名"
-                    val outputDex = File(getSafeOutputDirectory(), "enc_${inputApk.name}")
+                    val outputDex = File(getSafeOutputDirectory(), "$outPrefix${inputApk.name}")
                     FileOutputStream(outputDex).use { it.write(modifiedDexMap.values.first()) }
                     handler.post {
                         llLoading.visibility = View.GONE
@@ -375,7 +408,7 @@ private fun showEncryptDialog(inputApk: File) {
                 } else {
                     // APK：重新打包
                     handler.post { tvStatus.text = "正在重新打包 APK..." }
-                    val outputApk = File(getSafeOutputDirectory(), "enc_${inputApk.name}")
+                    val outputApk = File(getSafeOutputDirectory(), "$outPrefix${inputApk.name}")
                     repackApk(inputApk, modifiedDexMap, outputApk)
                     handler.post {
                         llLoading.visibility = View.GONE
@@ -401,35 +434,37 @@ private fun showEncryptDialog(inputApk: File) {
 
 
 
-    private fun setupEncryptOptions() {
-        val methodRow = findViewById<LinearLayout>(R.id.ll_method_row)
-        val methodArrow = findViewById<TextView>(R.id.tv_method_arrow)
-        val methodValue = findViewById<TextView>(R.id.tv_method_value)
-        val methodOptions = findViewById<LinearLayout>(R.id.ll_method_options)
-        val strengthRow = findViewById<LinearLayout>(R.id.ll_strength_row)
-        val strengthArrow = findViewById<TextView>(R.id.tv_strength_arrow)
-        val strengthValue = findViewById<TextView>(R.id.tv_strength_value)
-        val strengthOptions = findViewById<LinearLayout>(R.id.ll_strength_options)
+    /** 把加密配置的 UI 绑到给定根视图上（配置弹窗用） */
+    private fun bindEncryptOptions(root: View) {
+        val methodRow = root.findViewById<LinearLayout>(R.id.ll_method_row)
+        val methodArrow = root.findViewById<TextView>(R.id.tv_method_arrow)
+        val methodValue = root.findViewById<TextView>(R.id.tv_method_value)
+        val methodOptions = root.findViewById<LinearLayout>(R.id.ll_method_options)
+        val strengthRow = root.findViewById<LinearLayout>(R.id.ll_strength_row)
+        val strengthArrow = root.findViewById<TextView>(R.id.tv_strength_arrow)
+        val strengthValue = root.findViewById<TextView>(R.id.tv_strength_value)
+        val strengthOptions = root.findViewById<LinearLayout>(R.id.ll_strength_options)
 
-        findViewById<Switch>(R.id.sw_anti_decrypt).setOnCheckedChangeListener { _, checked ->
-            antiDecrypt = checked
-        }
+        val swAnti = root.findViewById<Switch>(R.id.sw_anti_decrypt)
+        // 先复位再挂监听，避免程序化设置时反过来触发回调
+        swAnti.isChecked = antiDecrypt
+        swAnti.setOnCheckedChangeListener { _, checked -> antiDecrypt = checked }
 
         val methodViews = listOf(
-            "Base64" to findViewById<TextView>(R.id.op_method_base64),
-            "AES" to findViewById<TextView>(R.id.op_method_aes),
-            "DES" to findViewById<TextView>(R.id.op_method_des),
-            "RC4" to findViewById<TextView>(R.id.op_method_rc4)
+            "Base64" to root.findViewById<TextView>(R.id.op_method_base64),
+            "AES" to root.findViewById<TextView>(R.id.op_method_aes),
+            "DES" to root.findViewById<TextView>(R.id.op_method_des),
+            "RC4" to root.findViewById<TextView>(R.id.op_method_rc4)
         )
         val strengthViews = listOf(
-            "low" to findViewById<TextView>(R.id.op_strength_low),
-            "medium" to findViewById<TextView>(R.id.op_strength_medium),
-            "high" to findViewById<TextView>(R.id.op_strength_high)
+            "low" to root.findViewById<TextView>(R.id.op_strength_low),
+            "medium" to root.findViewById<TextView>(R.id.op_strength_medium),
+            "high" to root.findViewById<TextView>(R.id.op_strength_high)
         )
 
         fun paint(view: TextView, selected: Boolean, label: String) {
             view.text = (if (selected) "● " else "○ ") + label
-            view.setTextColor(Color.parseColor(if (selected) "#3A7AFE" else "#555555"))
+            view.setTextColor(Color.parseColor(if (selected) "#4C7591" else "#555555"))
             view.setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
         }
 
@@ -461,6 +496,262 @@ private fun showEncryptDialog(inputApk: File) {
 
         renderMethod()
         renderStrength()
+    }
+
+    // ============ 功能选择：Dex加密 / Dex混淆（单选，空心圆 → 实心） ============
+
+    private var dexEncryptChecked = false
+    private var dexObfuscateChecked = false
+
+    // StringFog 配置
+    private var fogEnabled = true
+    private var fogKeyLength = 8
+    private var fogEnhanced = false
+    private var fogJunk = 5
+
+    private fun setupFunctionList() {
+        val encRow = findViewById<View>(R.id.row_dex_encrypt)
+        val encDot = findViewById<RadioDotView>(R.id.v_dex_radio)
+        val obfRow = findViewById<View>(R.id.row_dex_obfuscate)
+        val obfDot = findViewById<RadioDotView>(R.id.v_dex_obf_radio)
+
+        // 只能选一个：勾上自己就把另一个取消
+        encRow.setOnClickListener {
+            dexEncryptChecked = !dexEncryptChecked
+            if (dexEncryptChecked) dexObfuscateChecked = false
+            encDot.setCheckedState(dexEncryptChecked, true)
+            obfDot.setCheckedState(dexObfuscateChecked, true)
+        }
+        obfRow.setOnClickListener {
+            dexObfuscateChecked = !dexObfuscateChecked
+            if (dexObfuscateChecked) dexEncryptChecked = false
+            encDot.setCheckedState(dexEncryptChecked, true)
+            obfDot.setCheckedState(dexObfuscateChecked, true)
+        }
+
+        encDot.setCheckedState(dexEncryptChecked, false)
+        obfDot.setCheckedState(dexObfuscateChecked, false)
+    }
+
+    /** 把混淆配置（StringFog）的 UI 绑到给定根视图上 */
+    private fun bindObfuscationOptions(root: View) {
+        val swEnable = root.findViewById<Switch>(R.id.sw_fog_enable)
+        swEnable.isChecked = fogEnabled
+        swEnable.setOnCheckedChangeListener { _, checked -> fogEnabled = checked }
+
+        val keyRow = root.findViewById<LinearLayout>(R.id.ll_fog_key_row)
+        val keyArrow = root.findViewById<TextView>(R.id.tv_fog_key_arrow)
+        val keyValue = root.findViewById<TextView>(R.id.tv_fog_key_value)
+        val keyOptions = root.findViewById<LinearLayout>(R.id.ll_fog_key_options)
+
+        val keyViews = listOf(
+            4 to root.findViewById<TextView>(R.id.op_fog_4),
+            8 to root.findViewById<TextView>(R.id.op_fog_8),
+            16 to root.findViewById<TextView>(R.id.op_fog_16)
+        )
+
+        fun paint(view: TextView, selected: Boolean, label: String) {
+            view.text = (if (selected) "● " else "○ ") + label
+            view.setTextColor(Color.parseColor(if (selected) "#4C7591" else "#555555"))
+            view.setTypeface(null, if (selected) Typeface.BOLD else Typeface.NORMAL)
+        }
+
+        fun renderKey() {
+            keyValue.text = "$fogKeyLength"
+            keyViews.forEach { (len, view) ->
+                paint(view, len == fogKeyLength, if (len == 8) "8 字节（推荐）" else "$len 字节")
+            }
+        }
+
+        keyRow.setOnClickListener { toggleDrawer(keyOptions, keyArrow) }
+        keyViews.forEach { (len, view) ->
+            view.setOnClickListener {
+                fogKeyLength = len
+                renderKey()
+            }
+        }
+        renderKey()
+
+        val swEnhanced = root.findViewById<Switch>(R.id.sw_fog_enhanced)
+        val junkPanel = root.findViewById<View>(R.id.ll_junk_panel)
+
+        swEnhanced.isChecked = fogEnhanced
+        swEnhanced.setOnCheckedChangeListener { _, checked ->
+            fogEnhanced = checked
+            // 和两个抽屉同一套：高度 0 <-> 内容高度，先快后慢
+            animateDrawer(junkPanel, checked)
+        }
+        // 打开弹窗时如果增强已经开着，把面板撑开
+        if (fogEnhanced) animateDrawer(junkPanel, true)
+
+        // 垃圾倍率：滑动条，进度 0..99 对应 1..100 条
+        val sbJunk = root.findViewById<android.widget.SeekBar>(R.id.sb_junk)
+        val tvJunk = root.findViewById<TextView>(R.id.tv_junk_value)
+        sbJunk.max = 99
+        sbJunk.progress = (fogJunk - 1).coerceIn(0, 99)
+        tvJunk.text = "$fogJunk"
+        sbJunk.setOnSeekBarChangeListener(object : android.widget.SeekBar.OnSeekBarChangeListener {
+            override fun onProgressChanged(
+                seekBar: android.widget.SeekBar?,
+                progress: Int,
+                fromUser: Boolean
+            ) {
+                fogJunk = progress + 1
+                tvJunk.text = "$fogJunk"
+            }
+
+            override fun onStartTrackingTouch(seekBar: android.widget.SeekBar?) {}
+
+            override fun onStopTrackingTouch(seekBar: android.widget.SeekBar?) {}
+        })
+    }
+
+    // ============ 配置弹窗（Activity 内遮罩层实现） ============
+    //
+    // 不用 AlertDialog：Dialog 是独立 Window，内容高度一变就要 relayout 窗口
+    // （一次 IPC + surface 调整），高度动画每帧都会触发，抽屉就会卡。
+    // 放进 Activity 自己的窗口里，窗口尺寸恒为 match_parent，每帧只重排这棵小子树。
+
+    private var configOverlay: View? = null
+    private var configCard: View? = null
+    private var configClosing = false
+
+    /**
+     * 「Dex加密配置」弹窗。
+     * 圆角，样式与「选择要加密的DEX」弹窗一致；左下取消、右下确定。
+     * 确定之后才回到正常流程：申请权限 -> 勾选 DEX -> 加密。
+     *
+     * 进场：遮罩先淡入，卡片稍慢一点淡入并从 0.88 放大到 1（先快后慢）。
+     */
+    private fun showDexConfigDialog(onConfirm: () -> Unit) {
+        // 保险：清掉可能残留的旧遮罩
+        configOverlay?.let { (it.parent as? ViewGroup)?.removeView(it) }
+        configOverlay = null
+        configCard = null
+        configClosing = false
+
+        val content = findViewById<FrameLayout>(android.R.id.content)
+        val overlay = layoutInflater.inflate(R.layout.overlay_dex_config, content, false)
+        content.addView(
+            overlay,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT
+            )
+        )
+        configOverlay = overlay
+
+        val scrim = overlay.findViewById<View>(R.id.config_scrim)
+        val card = overlay.findViewById<View>(R.id.config_card)
+        configCard = card
+
+        // 标题与分区：勾了哪个就只显示哪个的配置，两个都勾就都显示
+        val title = overlay.findViewById<TextView>(R.id.tv_config_title)
+        val sectionEncrypt = overlay.findViewById<View>(R.id.section_encrypt)
+        val sectionObfuscate = overlay.findViewById<View>(R.id.section_obfuscate)
+        when {
+            dexEncryptChecked && dexObfuscateChecked -> {
+                title.text = "Dex配置"
+                sectionEncrypt.visibility = View.VISIBLE
+                sectionObfuscate.visibility = View.VISIBLE
+            }
+            dexObfuscateChecked -> {
+                title.text = "Dex混淆配置"
+                sectionEncrypt.visibility = View.GONE
+                sectionObfuscate.visibility = View.VISIBLE
+            }
+            else -> {
+                title.text = "Dex加密配置"
+                sectionEncrypt.visibility = View.VISIBLE
+                sectionObfuscate.visibility = View.GONE
+            }
+        }
+
+        bindEncryptOptions(overlay)
+        bindObfuscationOptions(overlay)
+
+        overlay.findViewById<TextView>(R.id.btn_config_cancel).setOnClickListener {
+            dismissDexConfig()
+        }
+        overlay.findViewById<TextView>(R.id.btn_config_ok).setOnClickListener {
+            dismissDexConfig(onDone = onConfirm)
+        }
+        // 点弹窗外的空白处（遮罩）= 返回，直接关掉
+        // 卡片在 XML 里设了 clickable=true，所以点卡片本身不会误触到这里
+        overlay.setOnClickListener { dismissDexConfig() }
+
+        // ===== 进场动画 =====
+        // 遮罩先淡入，卡片稍慢，同时从 0.88 放大到 1，就有「弹出来」的渐显感
+        scrim.alpha = 0f
+        scrim.animate()
+            .alpha(1f)
+            .setDuration(OVERLAY_SCRIM_MS)
+            .start()
+
+        card.scaleX = 0.88f
+        card.scaleY = 0.88f
+        card.alpha = 0f
+        card.animate()
+            .alpha(1f)
+            .scaleX(1f)
+            .scaleY(1f)
+            .setDuration(OVERLAY_CARD_MS)
+            .setInterpolator(DecelerateInterpolator(1.6f))
+            .start()
+    }
+
+    /**
+     * 关掉配置弹窗。
+     * immediate = true 直接移除；否则先播收回动画，动画结束再移除并回调 onDone。
+     */
+    private fun dismissDexConfig(immediate: Boolean = false, onDone: (() -> Unit)? = null) {
+        val overlay = configOverlay ?: return
+        if (configClosing) return
+        configClosing = true
+
+        val card = configCard
+        // 抽屉 View 每次都新建，关掉时把动画/开合状态清掉，别攒引用
+        drawerAnimators.clear()
+        openDrawers.clear()
+
+        val finish = Runnable {
+            if (configOverlay === overlay) {
+                configOverlay = null
+                configCard = null
+            }
+            configClosing = false
+            (overlay.parent as? ViewGroup)?.removeView(overlay)
+            onDone?.invoke()
+        }
+
+        if (immediate || !overlay.isAttachedToWindow) {
+            finish.run()
+            return
+        }
+
+        // ===== 收回动画 =====
+        // 整体淡出，卡片同时微微缩小
+        if (card != null) {
+            card.animate()
+                .scaleX(0.94f)
+                .scaleY(0.94f)
+                .setDuration(OVERLAY_EXIT_MS)
+                .start()
+        }
+        overlay.animate()
+            .alpha(0f)
+            .setDuration(OVERLAY_EXIT_MS)
+            .withEndAction(finish)
+            .start()
+    }
+
+    @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+    override fun onBackPressed() {
+        if (configOverlay != null) {
+            dismissDexConfig()
+        } else {
+            super.onBackPressed()
+        }
     }
 
     // ============ 抽屉动画：先快后慢 ============
@@ -1130,6 +1421,11 @@ private fun getRealPathFromUri(uri: Uri): String? {
         // 抽屉弹出抽查动画！！！噢齁齁齁齁齁齁
         private const val DRAWER_DURATION_MS = 300L
         private const val DRAWER_DECELERATE_FACTOR = 1.0f
+
+        // 配置弹窗进场 / 退场节奏
+        private const val OVERLAY_SCRIM_MS = 200L
+        private const val OVERLAY_CARD_MS = 260L
+        private const val OVERLAY_EXIT_MS = 160L
 
         private val METHOD_LABELS = mapOf(
             "Base64" to "Base64（仅编码混淆）",
